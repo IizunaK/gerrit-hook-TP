@@ -1,0 +1,201 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys
+import datetime
+import time
+
+import argparse
+import pprint
+import re
+import subprocess
+
+import simplejson
+import requests
+
+#tp authent
+tp_username = "Toto"
+tp_password = "toto1234"
+proxies = {"http" : "proxy1:port",
+           "https" : "proxy2:port"}
+session = requests.Session()
+session.auth = (tp_username, tp_password)
+session.timeout = 5
+session.proxies = proxies
+
+# the regex we use for findig the issue id
+tp_issue_id_regex = '\#(\d+)'
+
+#urls
+url_revisions = 'https://schibstedfr.tpondemand.com/api/v1/Revisions?take=1000&format=json'
+url_revision_files = 'https://schibstedfr.tpondemand.com/api/v1/RevisionFiles?take=1000&format=json'
+
+url_assignables_begin = "https://schibstedfr.tpondemand.com/api/v1/Assignables/"
+url_assignables = "https://schibstedfr.tpondemand.com/api/v1/Assignables?include=[ID]&take=3000&format=json"
+
+GIT_PATH = "/srv/gerrit/git"
+
+pp = pprint.PrettyPrinter(indent=4)
+
+def execute_and_return_output(command, projectName):
+    directory = "%s/%s.git" % (GIT_PATH, projectName)
+    process_pipe = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=directory)
+    output, errors = process_pipe.communicate()
+    return output
+
+def gerrit_get_commit_msg(commit_id, project_name):
+    command = ["git", 'rev-list', '--pretty', '--max-count=1', str(commit_id)]
+    commitmsg = execute_and_return_output(command, project_name)
+    if not commitmsg or len(commitmsg) < 10:
+        print "no commit msg!"
+        sys.exit(0)
+    return commitmsg
+
+def iter_on_regexp(commitmsg):
+    regex = re.compile(tp_issue_id_regex, re.IGNORECASE)
+    message_list = regex.finditer(commitmsg)
+    return message_list
+
+def create_tp_message(tpid, patchset, uploader, commitid, changeurl):
+    if not tpid or tpid == 0:
+        print "no issue set here"
+        sys.exit(0)
+    tpcomment = "Gerrit received a related patchset #%s for Issue #%s.\n" % (patchset, tpid)
+    tpcomment += "Uploader: @%s\n" % uploader
+    tpcomment += "Commit-Id: %s\n" % commitid
+    tpcomment += "Gerrit URL: %s\n" % changeurl
+    print tpcomment
+    return tpcomment
+
+def get_url_info(url):
+    print "*** Get url json info"
+    try:
+        response = session.get(url)
+        json_to_change = response.content
+        print response.status_code
+        if int(response.status_code) != 200:
+            print "Connection to TP incorrect"
+            sys.exit(0)
+        else:
+            print "Connection OK"
+        json_to_change = simplejson.loads(json_to_change)
+        pp.pprint(json_to_change)
+        return json_to_change
+    except requests.exceptions.ConnectionError as error_message:
+        print error_message
+        sys.exit(0)
+
+def tp_find_issue(tpid):
+    assignables = get_url_info(url_assignables)
+    for i in xrange(len(assignables["Items"])):
+        if str(tpid) == str(assignables["Items"][i]["Id"]):
+            print "found id"
+            return tpid
+        else:
+            continue
+    print "No issue found in TP"
+    sys.exit(0)
+
+def create_comment_date():
+    now_time = time.mktime(datetime.datetime.now().timetuple())
+    now_time = str(now_time).replace(".0", "")
+    now_time = now_time + "000+0100"
+    return now_time
+
+def get_comment_name(tpid):
+    url_assign = url_assignables_begin + str(tpid) + "?format=json"
+    assignable_data = get_url_info(url_assign)
+    name = assignable_data["Name"]
+    return name
+
+
+def create_json_comment(tpid, tpcomment):
+    url = url_assignables_begin + str(tpid) + "/Comments?format=json"
+    comments_list = get_url_info(url)
+    comments_list["Items"].append({})
+
+    new_comment = {}
+
+    now_time = create_comment_date()
+    new_comment["CreateDate"] = '/Date(%s)/'%now_time
+
+    new_comment["Description"] = str("<!--markdown-->" + tpcomment)
+
+    new_comment["General"] = {}
+    new_comment["General"]['ResourceType'] = "General"
+    new_comment["General"]['Id'] = int(tpid)
+
+    name = get_comment_name(tpid)
+    new_comment["General"]['Name'] = name
+
+    new_comment['Owner'] = {'FirstName': 'Toto',
+                            'Id': int("Id_of_Toto_user"),
+                            'LastName': 'Toto',
+                            'Login': 'TotoToto',
+                            'ResourceType': 'GeneralUser'}
+
+    new_comment['ParentId'] = None
+
+    pp.pprint(new_comment)
+    return new_comment
+
+
+def upload_comment_to_tp(tpid, comments_list):
+    headers = {'Content-Type': 'application/json'}
+    comments_list = str(comments_list)
+    text = eval('[' + comments_list + ']')
+    url = url_assignables_begin + str(tpid) + "/Comments?format=json"
+    session.post(url,
+                 data=simplejson.dumps(text),
+                 auth=(tp_username, tp_password),
+                 headers=headers)
+
+def main():
+    print "*** Beginning"
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--change', dest='changeid')
+    parser.add_argument('-d', '--is-draft', dest='isdraft')
+    parser.add_argument('-k', '--kind', dest='kind')
+    parser.add_argument('-u', '--change-url', dest='changeurl')
+    parser.add_argument('-w', '--change-owner', type=str, dest='changeowner')
+    parser.add_argument('-p', '--project', dest='project')
+    parser.add_argument('-b', '--branch', dest='branch')
+    parser.add_argument('-s', '--uploader', type=str, dest='uploader')
+    parser.add_argument('-o', '--commit', dest='commit')
+    parser.add_argument('-a', '--patchset', dest='patchset')
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+    try:
+        arguments = parser.parse_args()
+    except IOError, msg:
+        parser.error(str(msg))
+
+    uploader = arguments.uploader
+    uploader = uploader.split("(", 1)[1]
+    uploader = uploader.replace(")", "")
+
+    commitmsg = gerrit_get_commit_msg(arguments.commit, arguments.project)
+
+    # update status only for the first patchset
+    if int(arguments.patchset) != 1:
+        print "Not the first patchset (%s) for this issue (%s), will not update the status" % (arguments.patchset, arguments.changeurl)
+        sys.exit(0)
+
+    message_list = iter_on_regexp(commitmsg)
+    for message_i in message_list:
+        tpid = int(message_i.group(1))
+        tpcomment = create_tp_message(tpid,
+                                      arguments.patchset,
+                                      uploader,
+                                      arguments.commit,
+                                      arguments.changeurl)
+        tp_find_issue(tpid)
+        comments_list = create_json_comment(tpid, tpcomment)
+        upload_comment_to_tp(tpid, comments_list)
+    print "*** Finished"
+
+
+if __name__ == "__main__":
+    exit(main())
